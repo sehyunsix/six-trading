@@ -268,14 +268,17 @@
             </div>
         </div>
 
-        <div class="card">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-                <h2 style="margin:0">Equity Curve Comparison (Sampling Applied)</h2>
-                <button class="btn" style="padding: 5px 10px; font-size: 0.8rem;" onclick="resetChartZoom()">Reset
-                    Zoom</button>
-            </div>
-            <div class="chart-container">
-                <canvas id="backtestChart"></canvas>
+        <div id="charts-container">
+            <!-- Dynamic charts will be rendered here -->
+            <div class="card" id="main-chart-card">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                    <h2 style="margin:0">Equity Curve Comparison</h2>
+                    <button class="btn" style="padding: 5px 10px; font-size: 0.8rem;" onclick="resetChartZoom()">Reset
+                        Zoom</button>
+                </div>
+                <div class="chart-container">
+                    <canvas id="backtestChart"></canvas>
+                </div>
             </div>
         </div>
 
@@ -595,99 +598,151 @@
             }
         }
 
+        let backtestCharts = [];
+
         function renderReports(reports) {
             const grid = document.getElementById('results-grid');
             grid.innerHTML = '';
 
-            const sorted = [...reports].sort((a, b) => b.yield_pct - a.yield_pct);
+            const groupedBySymbol = reports.reduce((acc, repo) => {
+                if (!acc[repo.symbol]) acc[repo.symbol] = [];
+                acc[repo.symbol].push(repo);
+                return acc;
+            }, {});
 
-            const table = document.createElement('table');
-            table.style.cssText = 'width: 100%; border-collapse: collapse; font-size: 0.85rem;';
-            table.innerHTML = `
-                <thead>
-                    <tr style="background: rgba(255,255,255,0.05); text-align: left;">
-                        <th style="padding: 10px; border-bottom: 1px solid #333;">Market</th>
-                        <th style="padding: 10px; border-bottom: 1px solid #333;">Strategy</th>
-                        <th style="padding: 10px; border-bottom: 1px solid #333; text-align: right;">Trades</th>
-                        <th style="padding: 10px; border-bottom: 1px solid #333; text-align: right;">Yield</th>
-                        <th style="padding: 10px; border-bottom: 1px solid #333; text-align: right;">Win%</th>
-                        <th style="padding: 10px; border-bottom: 1px solid #333; text-align: right;">Sharpe</th>
-                        <th style="padding: 10px; border-bottom: 1px solid #333; text-align: right;">Max DD</th>
-                        <th style="padding: 10px; border-bottom: 1px solid #333;">Indicators</th>
-                    </tr>
-                </thead>
-                <tbody id="results-tbody"></tbody>
-            `;
+            Object.entries(groupedBySymbol).forEach(([symbol, symbolReports]) => {
+                const symbolContainer = document.createElement('div');
+                symbolContainer.className = 'card';
+                symbolContainer.style.marginBottom = '20px';
 
-            const tbody = table.querySelector('#results-tbody');
-            sorted.forEach(repo => {
-                const pnlColor = repo.yield_pct >= 0 ? 'var(--accent-green)' : 'var(--accent-red)';
-                const row = document.createElement('tr');
-                row.style.cssText = 'border-bottom: 1px solid #222;';
-                row.innerHTML = `
-                    <td style="padding: 8px; font-weight: bold; color: var(--accent-blue);">${repo.symbol}</td>
-                    <td style="padding: 8px;">${repo.strategy_name}</td>
-                    <td style="padding: 8px; text-align: right;">${repo.total_trades}</td>
-                    <td style="padding: 8px; text-align: right; color: ${pnlColor}; font-weight: bold;">${repo.yield_pct.toFixed(2)}%</td>
-                    <td style="padding: 8px; text-align: right;">${repo.win_rate.toFixed(1)}%</td>
-                    <td style="padding: 8px; text-align: right;">${repo.sharpe_ratio.toFixed(2)}</td>
-                    <td style="padding: 8px; text-align: right; color: var(--accent-red);">${repo.max_drawdown.toFixed(2)}</td>
-                    <td style="padding: 8px; font-size: 0.7rem; color: var(--text-muted);">${Object.entries(repo.features).map(([k, v]) => `${k}:${v}`).join(' | ')}</td>
+                symbolContainer.innerHTML = `
+                    <h2 style="margin-top:0; color: var(--accent-blue); display: flex; align-items: center; gap: 10px;">
+                        ${symbol} 
+                        <span style="font-size: 0.8rem; background: rgba(33, 150, 243, 0.1); padding: 4px 8px; border-radius: 4px; color: var(--accent-blue);">
+                            ${symbolReports.length} strategies
+                        </span>
+                    </h2>
                 `;
-                tbody.appendChild(row);
+
+                const sorted = [...symbolReports].sort((a, b) => b.yield_pct - a.yield_pct);
+                const table = document.createElement('table');
+                table.style.cssText = 'width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-bottom: 15px;';
+                table.innerHTML = `
+                    <thead>
+                        <tr style="background: rgba(255,255,255,0.05); text-align: left;">
+                            <th style="padding: 10px; border-bottom: 1px solid #333;">Strategy</th>
+                            <th style="padding: 10px; border-bottom: 1px solid #333; text-align: right;">Trades</th>
+                            <th style="padding: 10px; border-bottom: 1px solid #333; text-align: right;">Yield</th>
+                            <th style="padding: 10px; border-bottom: 1px solid #333; text-align: right;">Win%</th>
+                            <th style="padding: 10px; border-bottom: 1px solid #333; text-align: right;">Sharpe</th>
+                            <th style="padding: 10px; border-bottom: 1px solid #333; text-align: right;">Max DD</th>
+                            <th style="padding: 10px; border-bottom: 1px solid #333;">Indicators</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tbody-${symbol.replace(/[:\s]/g, '-')}"></tbody>
+                `;
+
+                const tbody = table.querySelector(`#tbody-${symbol.replace(/[:\s]/g, '-')}`);
+                sorted.forEach(repo => {
+                    const pnlColor = repo.yield_pct >= 0 ? 'var(--accent-green)' : 'var(--accent-red)';
+                    const row = document.createElement('tr');
+                    row.style.cssText = 'border-bottom: 1px solid #222;';
+                    row.innerHTML = `
+                        <td style="padding: 8px; font-weight: bold;">${repo.strategy_name}</td>
+                        <td style="padding: 8px; text-align: right;">${repo.total_trades}</td>
+                        <td style="padding: 8px; text-align: right; color: ${pnlColor}; font-weight: bold;">${repo.yield_pct.toFixed(2)}%</td>
+                        <td style="padding: 8px; text-align: right;">${repo.win_rate.toFixed(1)}%</td>
+                        <td style="padding: 8px; text-align: right;">${repo.sharpe_ratio.toFixed(2)}</td>
+                        <td style="padding: 8px; text-align: right; color: var(--accent-red);">${repo.max_drawdown.toFixed(2)}</td>
+                        <td style="padding: 8px; font-size: 0.7rem; color: var(--text-muted);">${Object.entries(repo.features).map(([k, v]) => `${k}:${v}`).join(' | ')}</td>
+                    `;
+                    tbody.appendChild(row);
+                });
+                symbolContainer.appendChild(table);
+                grid.appendChild(symbolContainer);
             });
-            grid.appendChild(table);
-            renderMultiChart(reports);
+
+            renderMultiChart(groupedBySymbol);
         }
 
-        function renderMultiChart(reports) {
-            const ctx = document.getElementById('backtestChart').getContext('2d');
-            if (backtestChart) backtestChart.destroy();
+        function renderMultiChart(groupedReports) {
+            const container = document.getElementById('charts-container');
+            container.innerHTML = '';
+            backtestCharts = [];
 
             const colors = ['#2196F3', '#4CAF50', '#FF9800', '#E91E63', '#9C27B0', '#00BCD4', '#FFEB3B'];
-            const datasets = reports.map((repo, idx) => ({
-                label: `${repo.symbol} | ${repo.strategy_name}`,
-                data: repo.history.map(h => ({ x: h.timestamp, y: h.equity })),
-                borderColor: colors[idx % colors.length],
-                borderWidth: 2,
-                pointRadius: 0,
-                tension: 0.1
-            }));
 
-            backtestChart = new Chart(ctx, {
-                type: 'line',
-                data: { datasets },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    animation: false,
-                    scales: {
-                        x: {
-                            type: 'time',
-                            time: {
-                                displayFormats: {
-                                    hour: 'MMM d, HH:mm',
-                                    day: 'MMM d, yyyy',
-                                    week: 'MMM d, yyyy'
-                                },
-                                tooltipFormat: 'yyyy-MM-dd HH:mm'
+            Object.entries(groupedReports).forEach(([symbol, reports]) => {
+                const card = document.createElement('div');
+                card.className = 'card';
+                card.style.marginBottom = '20px';
+                card.innerHTML = `
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <h2 style="margin:0">Equity Curve: ${symbol}</h2>
+                        <button class="btn" style="padding: 5px 10px; font-size: 0.8rem;" onclick="resetChartZoom('${symbol}')">Reset Zoom</button>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="chart-${symbol.replace(/[:\s]/g, '-')}"></canvas>
+                    </div>
+                `;
+                container.appendChild(card);
+
+                const ctx = card.querySelector('canvas').getContext('2d');
+                const datasets = reports.map((repo, idx) => ({
+                    label: repo.strategy_name,
+                    data: repo.history.map(h => ({ x: h.timestamp, y: h.equity })),
+                    borderColor: colors[idx % colors.length],
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    tension: 0.1
+                }));
+
+                const chart = new Chart(ctx, {
+                    type: 'line',
+                    data: { datasets },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        animation: false,
+                        plugins: {
+                            zoom: {
+                                zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x' },
+                                pan: { enabled: true, mode: 'x' }
                             },
-                            ticks: { color: '#9e9e9e', maxRotation: 45 },
-                            grid: { color: 'rgba(255,255,255,0.05)' }
+                            legend: { labels: { color: '#9e9e9e', boxWidth: 10, font: { size: 10 } } }
                         },
-                        y: { ticks: { color: '#9e9e9e' }, title: { display: true, text: 'Equity (USDT)', color: '#9e9e9e' } }
-                    },
-                    plugins: {
-                        zoom: { zoom: { wheel: { enabled: true }, mode: 'x' }, pan: { enabled: true, mode: 'x' } },
-                        legend: { labels: { color: '#9e9e9e', boxWidth: 10, font: { size: 10 } } }
+                        scales: {
+                            x: {
+                                type: 'time',
+                                time: {
+                                    displayFormats: {
+                                        hour: 'MMM d, HH:mm',
+                                        day: 'MMM d, yyyy'
+                                    },
+                                    tooltipFormat: 'yyyy-MM-dd HH:mm'
+                                },
+                                ticks: { color: '#9e9e9e', maxRotation: 45 },
+                                grid: { color: 'rgba(255,255,255,0.05)' }
+                            },
+                            y: { ticks: { color: '#9e9e9e' }, title: { display: true, text: 'Equity (USDT)', color: '#9e9e9e' } }
+                        }
                     }
-                }
+                });
+                backtestCharts.push({ symbol, chart });
             });
         }
 
-        function resetChartZoom() { if (backtestChart) backtestChart.resetZoom(); }
+        function resetChartZoom(symbol) {
+            if (!symbol) {
+                backtestCharts.forEach(bc => bc.chart.resetZoom());
+            } else {
+                const bc = backtestCharts.find(bc => bc.symbol === symbol);
+                if (bc) bc.chart.resetZoom();
+            }
+        }
         window.onload = init;
     </script>
 </body>
 
 </html>
+```

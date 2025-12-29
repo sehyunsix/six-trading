@@ -539,211 +539,219 @@ async fn execute_isolated_backtest(
     let start_ts = payload.start_ts.unwrap_or(0);
     let end_ts = payload.end_ts.unwrap_or(u64::MAX);
 
-    let mut handles = Vec::new();
+    let mut symbol_handles = Vec::new();
+    let symbols = payload.symbols.clone();
+    let strategies = payload.strategies.clone();
+    let fast_mode = payload.fast_mode;
 
-    for symbol_spec in payload.symbols {
-        let parts: Vec<&str> = symbol_spec.split(':').collect();
-        if parts.len() != 2 {
-            log::error!("Invalid symbol format: {}", symbol_spec);
-            continue;
-        }
+    for symbol_spec in symbols {
+        let db_pool_inner = db_pool.clone();
+        let strategies_inner = strategies.clone();
         
-        let market_type = match parts[0].to_uppercase().as_str() {
-            "FUTURES" => crate::market_data::downloader::MarketType::Futures,
-            _ => crate::market_data::downloader::MarketType::Spot,
-        };
-        let symbol = parts[1].to_string();
-
-        // 0. Download missing data for this symbol
-        {
-            let downloader = crate::market_data::HistoricalDownloader::new(db_pool.clone());
-            if let Err(e) = downloader.ensure_data_range(&symbol, market_type, start_ts, end_ts).await {
-                log::error!("Failed to download historical data for {}: {}", symbol, e);
+        let handle = tokio::spawn(async move {
+            let parts: Vec<&str> = symbol_spec.split(':').collect();
+            if parts.len() != 2 {
+                log::error!("Invalid symbol format: {}", symbol_spec);
+                return Vec::new();
             }
-        }
+            
+            let market_type = match parts[0].to_uppercase().as_str() {
+                "FUTURES" => crate::market_data::downloader::MarketType::Futures,
+                _ => crate::market_data::downloader::MarketType::Spot,
+            };
+            let symbol = parts[1].to_string();
 
-        // 1. Load historical trades for this symbol
-        let trades = repository::get_historical_trades_range(
-            &db_pool, 
-            &symbol,
-            market_type.as_str(),
-            payload.start_ts, 
-            payload.end_ts
-        ).await.unwrap_or_default();
-        
-        if trades.is_empty() {
-            log::warn!("No trades found for {} ({}) in requested range", symbol, market_type.as_str());
-            continue;
-        }
-
-        log::info!("Loaded {} trades for backtesting {}", trades.len(), symbol);
-        let trades_arc = std::sync::Arc::new(trades);
-        let fast_mode = payload.fast_mode;
-
-        for strat_name in payload.strategies.clone() {
-            let trades_clone = trades_arc.clone();
-            let db_pool_clone = db_pool.clone();
-            let symbol_clone = symbol.clone();
-            let _market_type_clone = market_type;
-            let strat_name_clone = strat_name.clone();
-            let fast_mode_clone = fast_mode;
-
-            let handle = tokio::spawn(async move {
-                log::info!("[{} | {}] Starting backtest...", symbol_clone, strat_name_clone);
-                
-                let executor = std::sync::Arc::new(crate::execution::ExecutionManager::new(true));
-                let (dummy_tx, _) = mpsc::channel(1);
-                let backtest_state = std::sync::Arc::new(RwLock::new(AppState::new(
-                    "backtest".to_string(),
-                    strat_name_clone.clone(),
-                    db_pool_clone,
-                    symbol_clone.clone(),
-                    executor.clone(),
-                    dummy_tx
-                )));
-
-                {
-                    let mut write_guard = backtest_state.write().await;
-                    write_guard.clear_all_data();
-                    write_guard.max_history = 10_000;
-                    write_guard.state_machine.transition_to(crate::state_machine::SystemState::Trading);
-                    write_guard.is_trading = true;
+            // 0. Download missing data for this symbol
+            {
+                let downloader = crate::market_data::HistoricalDownloader::new(db_pool_inner.clone());
+                if let Err(e) = downloader.ensure_data_range(&symbol, market_type, start_ts, end_ts).await {
+                    log::error!("Failed to download historical data for {}: {}", symbol, e);
                 }
+            }
 
-                let mut strategy = match crate::strategy::StrategyFactory::create_strategy(&strat_name_clone) {
-                    Some(s) => s,
-                    None => return None,
-                };
+            // 1. Load historical trades for this symbol
+            let trades = repository::get_historical_trades_range(
+                &db_pool_inner, 
+                &symbol,
+                market_type.as_str(),
+                Some(start_ts), 
+                Some(end_ts)
+            ).await.unwrap_or_default();
+            
+            if trades.is_empty() {
+                log::warn!("No trades found for {} ({}) in requested range", symbol, market_type.as_str());
+                return Vec::new();
+            }
 
-                let mut trade_pnls = Vec::new();
-                let mut peak_pnl = 0.0;
-                let mut max_drawdown = 0.0;
-                let mut gross_profit = 0.0;
-                let mut gross_loss = 0.0;
-                let mut total_fees = 0.0;
+            log::info!("Loaded {} trades for backtesting {}", trades.len(), symbol);
+            let trades_arc = std::sync::Arc::new(trades);
+            let mut strat_handles = Vec::new();
 
-                let total_trades_count = trades_clone.len();
-                let progress_interval = (total_trades_count / 10).max(1);
-                let sample_rate = (total_trades_count / 2000).max(1);
-                
-                // Fast mode: skip every 10th trade for ~10x speedup
-                let fast_skip = if fast_mode_clone { 10 } else { 1 };
-                
-                {
-                    let mut write_guard = backtest_state.write().await;
-                    write_guard.sample_rate = sample_rate;
-                }
+            for strat_name in strategies_inner {
+                let trades_clone = trades_arc.clone();
+                let db_pool_clone = db_pool_inner.clone();
+                let symbol_clone = symbol.clone();
+                let strat_name_clone = strat_name.clone();
 
-                for (idx, trade) in trades_clone.iter().enumerate() {
-                    // Fast mode: only process every Nth trade
-                    if fast_mode_clone && idx % fast_skip != 0 {
-                        continue;
-                    }
+                let strat_handle = tokio::spawn(async move {
+                    log::info!("[{} | {}] Starting backtest...", symbol_clone, strat_name_clone);
                     
-                    let current_features: std::collections::HashMap<String, String> = strategy.get_features().into_iter().collect();
+                    let executor = std::sync::Arc::new(crate::execution::ExecutionManager::new(true));
+                    let (dummy_tx, _) = mpsc::channel(1);
+                    let backtest_state = std::sync::Arc::new(RwLock::new(AppState::new(
+                        "backtest".to_string(),
+                        strat_name_clone.clone(),
+                        db_pool_clone,
+                        symbol_clone.clone(),
+                        executor.clone(),
+                        dummy_tx
+                    )));
 
-                    if idx > 0 && idx % progress_interval == 0 {
-                        let progress_pct = (idx as f64 / total_trades_count as f64 * 100.0) as u32;
-                        let _ = PROGRESS_TX.send(ProgressEvent {
-                            symbol: symbol_clone.clone(),
-                            strategy_name: strat_name_clone.clone(),
-                            progress_pct,
-                            status: "running".to_string(),
-                            features: current_features.clone(),
-                        });
+                    {
+                        let mut write_guard = backtest_state.write().await;
+                        write_guard.clear_all_data();
+                        write_guard.max_history = 10_000;
+                        write_guard.state_machine.transition_to(crate::state_machine::SystemState::Trading);
+                        write_guard.is_trading = true;
                     }
 
-                    let opps = strategy.process_trade(trade.clone(), backtest_state.clone()).await;
+                    let mut strategy = match crate::strategy::StrategyFactory::create_strategy(&strat_name_clone) {
+                        Some(s) => s,
+                        None => return None,
+                    };
+
+                    let mut trade_pnls = Vec::new();
+                    let mut peak_pnl = 0.0;
+                    let mut max_drawdown = 0.0;
+                    let mut gross_profit = 0.0;
+                    let mut gross_loss = 0.0;
+                    let mut total_fees = 0.0;
+
+                    let total_trades_count = trades_clone.len();
+                    let progress_interval = (total_trades_count / 10).max(1);
+                    let sample_rate = (total_trades_count / 2000).max(1);
+                    let fast_skip = if fast_mode { 10 } else { 1 };
                     
                     {
                         let mut write_guard = backtest_state.write().await;
-                        write_guard.current_features = current_features;
+                        write_guard.sample_rate = sample_rate;
                     }
-                    
-                    for opp in opps {
-                        let price = trade.price.parse::<f64>().unwrap_or(0.0);
-                        let fee = match &opp.signal {
-                            Signal::Buy { quantity, .. } => price * quantity * 0.001,
-                            Signal::Sell { quantity, .. } => price * quantity * 0.001,
-                            _ => 0.0,
-                        };
-                        total_fees += fee;
 
-                        let pnl = executor.execute(opp.signal).await.unwrap_or(0.0);
+                    for (idx, trade) in trades_clone.iter().enumerate() {
+                        if fast_mode && idx % fast_skip != 0 {
+                            continue;
+                        }
+                        
+                        let current_features: std::collections::HashMap<String, String> = strategy.get_features().into_iter().collect();
+
+                        if idx > 0 && idx % progress_interval == 0 {
+                            let progress_pct = (idx as f64 / total_trades_count as f64 * 100.0) as u32;
+                            let _ = PROGRESS_TX.send(ProgressEvent {
+                                symbol: symbol_clone.clone(),
+                                strategy_name: strat_name_clone.clone(),
+                                progress_pct,
+                                status: "running".to_string(),
+                                features: current_features.clone(),
+                            });
+                        }
+
+                        let opps = strategy.process_trade(trade.clone(), backtest_state.clone()).await;
                         
                         {
                             let mut write_guard = backtest_state.write().await;
-                            write_guard.total_trades += 1;
-                            write_guard.realized_pnl += pnl - fee;
-                            
-                            if pnl > 0.0 {
-                                write_guard.win_trades += 1;
-                                trade_pnls.push(pnl - fee);
-                                gross_profit += pnl;
-                            } else if pnl < 0.0 {
-                                write_guard.loss_trades += 1;
-                                trade_pnls.push(pnl - fee);
-                                gross_loss += pnl.abs();
-                            }
+                            write_guard.current_features = current_features;
                         }
+                        
+                        for opp in opps {
+                            let price = trade.price.parse::<f64>().unwrap_or(0.0);
+                            let fee = match &opp.signal {
+                                Signal::Buy { quantity, .. } => price * quantity * 0.001,
+                                Signal::Sell { quantity, .. } => price * quantity * 0.001,
+                                _ => 0.0,
+                            };
+                            total_fees += fee;
 
-                        let current_total_pnl = backtest_state.read().await.realized_pnl;
-                        if current_total_pnl > peak_pnl { peak_pnl = current_total_pnl; }
-                        let drawdown = peak_pnl - current_total_pnl;
-                        if drawdown > max_drawdown { max_drawdown = drawdown; }
+                            let pnl = executor.execute(opp.signal).await.unwrap_or(0.0);
+                            
+                            {
+                                let mut write_guard = backtest_state.write().await;
+                                write_guard.total_trades += 1;
+                                write_guard.realized_pnl += pnl - fee;
+                                
+                                if pnl > 0.0 {
+                                    write_guard.win_trades += 1;
+                                    trade_pnls.push(pnl - fee);
+                                    gross_profit += pnl;
+                                } else if pnl < 0.0 {
+                                    write_guard.loss_trades += 1;
+                                    trade_pnls.push(pnl - fee);
+                                    gross_loss += pnl.abs();
+                                }
+                            }
+
+                            let current_total_pnl = backtest_state.read().await.realized_pnl;
+                            if current_total_pnl > peak_pnl { peak_pnl = current_total_pnl; }
+                            let drawdown = peak_pnl - current_total_pnl;
+                            if drawdown > max_drawdown { max_drawdown = drawdown; }
+                        }
                     }
-                }
-                
-                let final_features: std::collections::HashMap<String, String> = strategy.get_features().into_iter().collect();
-                let _ = PROGRESS_TX.send(ProgressEvent {
-                    symbol: symbol_clone.clone(),
-                    strategy_name: strat_name_clone.clone(),
-                    progress_pct: 100,
-                    status: "completed".to_string(),
-                    features: final_features.clone(),
+                    
+                    let final_features: std::collections::HashMap<String, String> = strategy.get_features().into_iter().collect();
+                    let _ = PROGRESS_TX.send(ProgressEvent {
+                        symbol: symbol_clone.clone(),
+                        strategy_name: strat_name_clone.clone(),
+                        progress_pct: 100,
+                        status: "completed".to_string(),
+                        features: final_features.clone(),
+                    });
+
+                    let report_guard = backtest_state.read().await;
+                    let win_rate = if report_guard.total_trades > 0 {
+                        (report_guard.win_trades as f64 / report_guard.total_trades as f64) * 100.0
+                    } else { 0.0 };
+                    
+                    let yield_pct = (report_guard.realized_pnl / report_guard.initial_balance) * 100.0;
+                    let profit_factor = if gross_loss > 0.0 { gross_profit / gross_loss } else { 0.0 };
+                    let avg_win = if report_guard.win_trades > 0 { gross_profit / report_guard.win_trades as f64 } else { 0.0 };
+                    let avg_loss = if report_guard.loss_trades > 0 { gross_loss / report_guard.loss_trades as f64 } else { 0.0 };
+
+                    let sharpe_ratio = if !trade_pnls.is_empty() {
+                        let mean = trade_pnls.iter().sum::<f64>() / trade_pnls.len() as f64;
+                        let variance = trade_pnls.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / trade_pnls.len() as f64;
+                        if variance > 0.0 { mean / variance.sqrt() } else { 0.0 }
+                    } else { 0.0 };
+
+                    Some(StrategyReport {
+                        symbol: symbol_clone,
+                        strategy_name: strat_name_clone,
+                        history: report_guard.history.iter().cloned().collect(),
+                        features: final_features,
+                        total_trades: report_guard.total_trades,
+                        win_rate,
+                        yield_pct,
+                        realized_pnl: report_guard.realized_pnl,
+                        max_drawdown,
+                        profit_factor,
+                        avg_win,
+                        avg_loss,
+                        sharpe_ratio,
+                        total_fees,
+                    })
                 });
+                strat_handles.push(strat_handle);
+            }
 
-                let report_guard = backtest_state.read().await;
-                let win_rate = if report_guard.total_trades > 0 {
-                    (report_guard.win_trades as f64 / report_guard.total_trades as f64) * 100.0
-                } else { 0.0 };
-                
-                let yield_pct = (report_guard.realized_pnl / report_guard.initial_balance) * 100.0;
-                let profit_factor = if gross_loss > 0.0 { gross_profit / gross_loss } else { 0.0 };
-                let avg_win = if report_guard.win_trades > 0 { gross_profit / report_guard.win_trades as f64 } else { 0.0 };
-                let avg_loss = if report_guard.loss_trades > 0 { gross_loss / report_guard.loss_trades as f64 } else { 0.0 };
-
-                let sharpe_ratio = if !trade_pnls.is_empty() {
-                    let mean = trade_pnls.iter().sum::<f64>() / trade_pnls.len() as f64;
-                    let variance = trade_pnls.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / trade_pnls.len() as f64;
-                    if variance > 0.0 { mean / variance.sqrt() } else { 0.0 }
-                } else { 0.0 };
-
-                Some(StrategyReport {
-                    symbol: symbol_clone,
-                    strategy_name: strat_name_clone,
-                    history: report_guard.history.iter().cloned().collect(),
-                    features: final_features,
-                    total_trades: report_guard.total_trades,
-                    win_rate,
-                    yield_pct,
-                    realized_pnl: report_guard.realized_pnl,
-                    max_drawdown,
-                    profit_factor,
-                    avg_win,
-                    avg_loss,
-                    sharpe_ratio,
-                    total_fees,
-                })
-            });
-            handles.push(handle);
-        }
+            let strat_results = futures::future::join_all(strat_handles).await;
+            strat_results.into_iter().filter_map(|r| r.ok().flatten()).collect::<Vec<StrategyReport>>()
+        });
+        symbol_handles.push(handle);
     }
 
-    let results = futures::future::join_all(handles).await;
-    let strategy_reports: Vec<StrategyReport> = results
+    let symbol_results = futures::future::join_all(symbol_handles).await;
+    let strategy_reports: Vec<StrategyReport> = symbol_results
         .into_iter()
-        .filter_map(|r| r.ok().flatten())
+        .filter_map(|r| r.ok())
+        .flatten()
         .collect();
 
     log::info!("Combinatorial backtest completed with {} results", strategy_reports.len());
